@@ -482,18 +482,18 @@ class BrowserEnv(Env):
             return f"Answered: {action_text}", True
 
         # 2. Click [Numerical_Label]
-        click_match = re.match(r"Click \[(\d+)\]", action_text, re.IGNORECASE)
+        click_match = re.match(r"Click \[?(\d+)\]?", action_text, re.IGNORECASE)
         if click_match:
             return self.browser.execute_raw_action('click', {'id': click_match.group(1)}, self.last_context), False
 
         # 3. Type [Numerical_Label]; [Content]
-        type_match = re.match(r"Type \[(\d+)\]; \[(.*)\]", action_text, re.IGNORECASE)
+        type_match = re.match(r"Type \[?(\d+)\]?[; ]+\[?(.[^\]]*)\]?", action_text, re.IGNORECASE)
         if type_match:
             return self.browser.execute_raw_action('type', {'id': type_match.group(1), 'content': type_match.group(2)},
                                                    self.last_context), False
 
         # 4. Scroll [Numerical_Label or WINDOW]; [up or down]
-        scroll_match = re.match(r"Scroll \[(.*)\]; \[(up|down)\]", action_text, re.IGNORECASE)
+        scroll_match = re.match(r"Scroll \[?(\d+|WINDOW)\]?[; ]+\[?(up|down)\]?", action_text, re.IGNORECASE)
         if scroll_match:
             return self.browser.execute_raw_action('scroll', {'target': scroll_match.group(1),
                                                               'direction': scroll_match.group(2)},
