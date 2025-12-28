@@ -21,6 +21,7 @@ from selenium.webdriver.common.keys import Keys
 
 import tinker
 from tinker import ModelInput
+# 恢复直接导入 ensure_text
 from tinker_cookbook.renderers import Message, Renderer, ensure_text, get_renderer
 from tinker_cookbook.rl.types import (
     Action,
@@ -206,7 +207,7 @@ class WebController:
                         include: (element.tagName === "INPUT" || element.tagName === "TEXTAREA" || element.tagName === "SELECT") ||
                                  (element.tagName === "BUTTON" || element.tagName === "A" || (element.onclick != null) || window.getComputedStyle(element).cursor == "pointer") ||
                                  (element.tagName === "IFRAME" || element.tagName === "VIDEO" || element.tagName === "LI" || element.tagName === "TD" || element.tagName === "OPTION"),
-                        area, rects, text: element.textContent.trim().replace(/\s{2,}/g, ' ')
+                        area, rects, text: element.textContent.trim().replace(/\\s{2,}/g, ' ')
                     };
                 }).filter(item => item.include && (item.area >= 20));
 
@@ -421,7 +422,7 @@ class BrowserEnv(Env):
         web_img_b64 = capture['screenshot']
         web_text = capture['web_text']
 
-        init_msg = f"Task Goal: {self.task.goal}"
+        init_msg = f"Task Goal: {self.task.goal}\n"
 
         # Using logic provided in prompt
         # Note: Tinker Message format expects content to be list if multimodal
@@ -432,11 +433,12 @@ class BrowserEnv(Env):
             if self.text_only:
                 return {'role': 'user', 'content': init_msg}
 
+            # --- 修改点：使用 'image' 键，而不是 'image_url' ---
             return {
                 'role': 'user',
                 'content': [
+                    {'type': 'image', 'image': f"data:image/png;base64,{web_img_b64}"},
                     {'type': 'text', 'text': init_msg},
-                    {'type': 'image_url', 'image_url': {"url": f"data:image/png;base64,{web_img_b64}"}}
                 ]
             }
         else:
@@ -449,11 +451,12 @@ class BrowserEnv(Env):
             if self.text_only:
                 return {'role': 'user', 'content': text_prompt}
 
+            # --- 修改点：使用 'image' 键，而不是 'image_url' ---
             return {
                 'role': 'user',
                 'content': [
+                    {'type': 'image', 'image': f"data:image/png;base64,{web_img_b64}"},
                     {'type': 'text', 'text': text_prompt},
-                    {'type': 'image_url', 'image_url': {"url": f"data:image/png;base64,{web_img_b64}"}}
                 ]
             }
 

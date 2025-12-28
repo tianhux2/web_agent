@@ -3,17 +3,21 @@ import logging
 import argparse
 import os
 
-# 导入 Tinker 核心库
+# Tinker 核心库
 import tinker
-from tinker_cookbook.utils import logtree
+from tinker_cookbook.completers import TinkerMessageCompleter
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.renderers import get_renderer
-from tinker_cookbook.completers import TinkerMessageCompleter
 from tinker_cookbook.model_info import get_recommended_renderer_name
 
+# --- 修改点：导入 image_processing_utils ---
+from tinker_cookbook.image_processing_utils import get_image_processor
+
 # 导入你之前定义的 Environment 代码
-# 假设你把之前的代码保存为 browser_env_def.py
-from browser_env_def import BrowserEnv, BrowserTask, SYSTEM_PROMPT_VISION
+from env import BrowserEnv, BrowserTask
+
+# 请替换为你的 API Key
+os.environ['TINKER_API_KEY'] = 'tml-Wrcd7jkyejehmtjAfQ8uUgyfyWtOwWQX8GCIqI6esrtLfD0FxsT6AiISJ5OPGovmjAAAA'
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -21,35 +25,60 @@ logger = logging.getLogger(__name__)
 
 
 async def run_single_episode(args):
-    # 1. 配置模型连接 (Agent)
-    # 使用 Tinker 的 ServiceClient 连接到本地的 vLLM 服务
-    service_client = tinker.ServiceClient(base_url=args.base_url, api_key="EMPTY")
+    # =========================================================================
+    # 修改点: 极简初始化
+    # =========================================================================
 
-    # 创建采样客户端
-    sampling_client = service_client.create_sampling_client(base_model=args.model_name)
+    # 1. 初始化 ServiceClient
+    service_client = tinker.ServiceClient()
 
-    # 获取 Tokenizer 和 Renderer (用于处理 Prompt template)
+    logger.info(f"Connected to Tinker Service. Model: {args.model_name}")
+
+    # 2. 创建采样客户端
+    sampling_client = service_client.create_sampling_client(
+        base_model=args.model_name
+    )
+
+    # =========================================================================
+    # Renderer 初始化优化
+    # =========================================================================
+
+    # 获取本地 Tokenizer
     tokenizer = get_tokenizer(args.model_name)
-    # 如果你的模型是 Llama3 且带有 Vision，可能需要特定的 renderer，这里使用推荐的
-    renderer_name = args.renderer_name or get_recommended_renderer_name(args.model_name)
-    renderer = get_renderer(renderer_name, tokenizer=tokenizer)
 
-    # 初始化 Completer (它负责将 Obs 发送给模型并获取回复)
+    # --- 修改点：使用 tinker_cookbook 的工具获取 image processor ---
+    logger.info("Loading Image Processor...")
+    try:
+        image_processor = get_image_processor(args.model_name)
+    except Exception as e:
+        logger.error(f"Failed to load image processor: {e}")
+        raise e
+
+    renderer_name = args.renderer_name or get_recommended_renderer_name(args.model_name)
+
+    logger.info(f"Initializing Renderer: {renderer_name}")
+    # --- 修改点：传入 image_processor ---
+    renderer = get_renderer(
+        renderer_name,
+        tokenizer=tokenizer,
+        image_processor=image_processor
+    )
+
+    # 初始化 Agent
     agent_completer = TinkerMessageCompleter(
         sampling_client=sampling_client,
         renderer=renderer,
-        max_tokens=128,  # 控制输出长度，动作通常很短
-        temperature=0.0,  # 测试时通常使用 0 温度以获得确定性结果
+        max_tokens=128,
     )
 
-    # 2. 初始化环境 (Environment)
+    # 3. 初始化环境
     task = BrowserTask(
-        id="test_001",
-        goal=args.goal,  # 例如: "Find the price of iPhone 15 on Amazon"
-        start_url=args.url  # 例如: "https://www.amazon.com"
+        id="test_cloud",
+        goal=args.goal,
+        start_url=args.url
     )
 
-    # headless=False 可以在本地弹窗看到浏览器自动操作的效果
+    # headless=False: 本地会弹出浏览器窗口，你可以看着 AI 操作
     env = BrowserEnv(task, renderer, text_only=args.text_only, headless=False)
 
     print(f"\n🚀 Starting Task: {task.goal}")
@@ -57,8 +86,7 @@ async def run_single_episode(args):
     print("-" * 50)
 
     try:
-        # 3. 获取初始观察 (Observation)
-        # obs 包含了 Prompt (System Prompt + 截图 + DOM Tree)
+        # 获取初始页面
         obs, stop_condition = await env.initial_observation()
 
         done = False
@@ -67,21 +95,18 @@ async def run_single_episode(args):
 
         while not done and step_count < max_steps:
             step_count += 1
-            print(f"\n[Step {step_count}] Thinking...")
+            print(f"\n[Step {step_count}] Requesting Remote Inference...")
 
-            # 4. Agent 推理 (Model Inference)
-            # 将环境的观察 (obs) 发送给模型，并传入停止词 (stop_condition)
-            # completion 是模型生成的文本 (例如: "Action: Click [15]")
-            completion = await agent_completer(obs, stop_sequences=stop_condition)
+            print(type(obs))
+            # 发送截图和文本到 Tinker 云端，等待返回 Action
+            completion = await agent_completer(obs)
 
             model_output = completion["content"]
             print(f"🤖 Model Action: {model_output}")
 
-            # 5. 环境执行 (Environment Step)
-            # 将模型的输出传回环境，环境解析动作、执行 Selenium 操作、计算奖励
+            # 本地浏览器执行 Action
             step_result = await env.step(completion)
 
-            # 6. 更新状态
             obs = step_result.next_observation
             done = step_result.episode_done
             reward = step_result.reward
@@ -95,23 +120,18 @@ async def run_single_episode(args):
             print(f"❌ Timed out after {max_steps} steps.")
 
     finally:
-        # 关闭浏览器
         env.browser.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # 模型参数
-    parser.add_argument("--model_name", type=str, required=True, help="vLLM启动的服务模型名称")
-    parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1", help="推理服务的地址")
-    parser.add_argument("--renderer_name", type=str, default=None, help="Tinker renderer 名称 (如 llama3, qwen2)")
-
-    # 任务参数
+    # 你的模型名称，例如 "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct",
+                        help="Tinker 平台上的 Base Model ID")
+    parser.add_argument("--renderer_name", type=str, default=None)
     parser.add_argument("--goal", type=str, default="Search for 'Tinker RL' on Google", help="任务目标")
     parser.add_argument("--url", type=str, default="https://www.google.com", help="起始URL")
-
-    # 环境配置
-    parser.add_argument("--text_only", action="store_true", help="是否仅使用纯文本模式 (无截图)")
+    parser.add_argument("--text_only", action="store_true")
 
     args = parser.parse_args()
 
