@@ -128,7 +128,7 @@ Observation: {Accessibility Tree of a web page}"""
 class WebController:
     """Encapsulates all Selenium and WebArena logic."""
 
-    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1280, 800), text_only: bool = False):
+    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1920, 1080), text_only: bool = False):
         self.headless = headless
         self.window_size = window_size
         self.text_only = text_only
@@ -147,6 +147,8 @@ class WebController:
         options.add_experimental_option("prefs", {
             "plugins.always_open_pdf_externally": True
         })
+
+        options.add_argument("--force-device-scale-factor=1.5")
 
         self.driver = webdriver.Chrome(options=options)
         self.driver.set_window_size(*self.window_size)
@@ -292,6 +294,19 @@ class WebController:
 
         # Capture Screenshot
         screenshot_b64 = self.driver.get_screenshot_as_base64()
+        
+        # Resize screenshot to 720p while maintaining aspect ratio
+        screenshot_b64 = self._resize_image_to_720p(screenshot_b64)
+        base64_string = screenshot_b64
+        if base64_string.startswith("data:image"):
+            base64_string = base64_string.split(",", 1)[1]
+
+        # 解码 Base64 字符串为二进制数据
+        image_data = base64.b64decode(base64_string)
+
+        # 保存到文件（例如保存为 PNG 格式）
+        with open(f"output_image{time.time()}.png", "wb") as f:
+            f.write(image_data)
 
         # Clean up red boxes
         if rects:
@@ -306,6 +321,27 @@ class WebController:
             "web_text": web_eles_text,
             "screenshot": screenshot_b64
         }
+        
+    def _resize_image_to_720p(self, image_b64: str) -> str:
+        """Resize image to 720p while maintaining aspect ratio."""
+        # Decode base64 image
+        image_bytes = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Target height is 720, calculate width to maintain aspect ratio
+        target_height = 720
+        aspect_ratio = image.width / image.height
+        target_width = int(target_height * aspect_ratio)
+        
+        # Resize image
+        resized_image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        
+        # Convert back to base64
+        buffer = io.BytesIO()
+        resized_image.save(buffer, format='PNG')
+        resized_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return resized_b64
 
     def execute_raw_action(self, action_type: str, args: dict, context: dict):
         web_eles = context.get('web_eles')
@@ -382,9 +418,11 @@ class WebController:
 
 @dataclass
 class BrowserTask:
-    id: str
+    annotation_id: str
+    action_uid: str
     goal: str
     start_url: str
+    history: [Message]
 
 
 class BrowserEnv(Env):

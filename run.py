@@ -2,6 +2,7 @@ import asyncio
 import logging
 import argparse
 import os
+import time
 
 # Tinker 核心库
 import tinker
@@ -62,7 +63,7 @@ async def run_single_episode(args):
 
         done = False
         step_count = 0
-        max_steps = 15
+        max_steps = 3
 
         while not done and step_count < max_steps:
             step_count += 1
@@ -81,6 +82,7 @@ async def run_single_episode(args):
                 stop_sequences=stop_condition
             )
 
+            start_time = time.time()
             # 调用 sample()
             future = sampling_client.sample(
                 prompt=obs,
@@ -90,6 +92,7 @@ async def run_single_episode(args):
 
             # 获取结果
             result = future.result()
+            print(f"time used: {time.time() - start_time}")
 
             # --- 关键修复：从 SampleResponse 中提取 Token 序列 ---
             # result 是 SampleResponse 对象
@@ -141,8 +144,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct",
                         help="Tinker 平台上的 Base Model ID")
     parser.add_argument("--renderer_name", type=str, default=None)
-    parser.add_argument("--goal", type=str, default="Search for 'Tinker RL' on Bing and scroll the page to the bottom", help="任务目标")
-    parser.add_argument("--url", type=str, default="https://www.bing.com", help="起始URL")
+    parser.add_argument("--goal", type=str, default="Browse for wall art with a price range of $25 to $50.", help="任务目标")
+    parser.add_argument("--url", type=str, default="file:///D:/Globus/4b2030ff-b83c-445f-bf87-9c8fbc68498b/processed/snapshots/a4c16da0-0706-4d0a-a259-eb7657bbbbc9_before.mhtml", help="起始URL")
     parser.add_argument("--text_only", action="store_true")
 
     args = parser.parse_args()
