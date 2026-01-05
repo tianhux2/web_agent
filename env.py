@@ -30,6 +30,8 @@ from tinker_cookbook.rl.types import (
     RLDataset,
     RLDatasetBuilder,
     StepResult,
+    Trajectory,
+    Metrics,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import logtree
@@ -85,7 +87,7 @@ Observation: {A labeled screenshot Given by User}"""
 SYSTEM_PROMPT_TEXT_ONLY = """Imagine you are a robot browsing the web, just like humans. Now you need to complete a task. In each iteration, you will receive an Accessibility Tree with numerical label representing information about the page, then follow the guidelines and choose one of the following actions:
 1. Click a Web Element.
 2. Delete existing content in a textbox and then type content. 
-3. Scroll up or down. Multiple scrolls are allowed to browse the webpage. Pay attention!! The default scroll is the whole window. If the scroll widget is located in a certain area of the webpage, then you have to specify a Web Element in that area. I would hover the mouse there and then scroll.
+3. Scroll up or down. Multiple scrolls are allowed to browse the webpage. Pay attention!! The default scroll is not the whole window. If the scroll widget is located in a certain area of the webpage, then you have to specify a Web Element in that area. I would hover the mouse there and then scroll.
 4. Wait. Typically used to wait for unfinished webpage processes, with a duration of 5 seconds.
 5. Go back, returning to the previous webpage.
 6. Google, directly jump to the Google search page. When you can't find information in some websites, try starting over with Google.
@@ -422,16 +424,16 @@ class BrowserTask:
     action_uid: str
     goal: str
     start_url: str
-    history: [Message]
+    history: list[Message]
 
 
 class BrowserEnv(Env):
     def __init__(
-            self,
-            task: BrowserTask,
-            renderer: Renderer,
-            text_only: bool = False,
-            headless: bool = True
+        self,
+        task: BrowserTask,
+        renderer: Renderer,
+        text_only: bool = False,
+        headless: bool = True
     ):
         self.task = task
         self.renderer = renderer
@@ -439,12 +441,13 @@ class BrowserEnv(Env):
         self.browser = WebController(headless=headless, text_only=text_only)
 
         self.steps = 0
-        self.history: list[Message] = []
+        self.history: list[Message] = list(task.history) if task.history else []  # Initialize with task's history
         self.last_context = {}
         self.done = False
 
-        # Initial Navigation
-        self.browser.navigate(task.start_url)
+        # Initial Navigation - Load the mhtml file based on annotation_id and action_uid
+        mhtml_path = f"file://D:\\Globus\\{task.annotation_id}\\processed\\snapshots\\{task.action_uid}_before.mhtml"
+        self.browser.navigate(mhtml_path)
 
     @property
     def stop_condition(self) -> StopCondition:
@@ -462,10 +465,8 @@ class BrowserEnv(Env):
 
         init_msg = f"Task Goal: {self.task.goal}\n"
 
-        # Using logic provided in prompt
-        # Note: Tinker Message format expects content to be list if multimodal
-
-        if self.steps == 1:
+        # Note: We only add the initial message if there's no existing history
+        if len(self.history) <= 2:  # Only system message and initial user message
             init_msg += f"I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
 
             if self.text_only:
@@ -506,7 +507,12 @@ class BrowserEnv(Env):
         sys_msg: Message = {"role": "system", "content": sys_content}
 
         user_msg = self._format_msg()
-        self.history = [sys_msg, user_msg]
+        # Only append to history if it's not already initialized
+        if not self.history:
+            self.history = [sys_msg, user_msg]
+        else:
+            # If history already exists (has previous steps), just add the new user message
+            self.history.append(user_msg)
 
         return self.renderer.build_generation_prompt(self.history), self.stop_condition
 
@@ -603,7 +609,7 @@ class BrowserEnv(Env):
 
 
 # ==============================================================================
-# SECTION 4: Dataset & Builders
+# SECTION 4: Dataset & Builders with Step-by-Step Training Support
 # ==============================================================================
 
 @dataclass(frozen=True)
@@ -618,6 +624,51 @@ class BrowserEnvGroupBuilder(EnvGroupBuilder):
             BrowserEnv(task, self.renderer, self.text_only, self.headless)
             for task in self.tasks
         ]
+    
+    async def compute_group_rewards(
+        self, 
+        trajectory_group: list[Trajectory], 
+        env_group: Sequence[Env]
+    ) -> list[tuple[float, Metrics]]:
+        """
+        计算组中每条轨迹的奖励，然后只将奖励最高的最优轨迹的输入输出加入到数据缓冲区中，
+        确保历史累积数据的质量和有效性。
+        """
+        # 计算每条轨迹的奖励
+        rewards = []
+        for trajectory in trajectory_group:
+            # 从轨迹中获取奖励信息
+            total_reward = sum([step.reward for step in trajectory.steps])
+            metrics = trajectory.steps[-1].metrics if trajectory.steps else {}
+            rewards.append((total_reward, metrics))
+        
+        # 找到奖励最高的轨迹索引
+        if rewards:
+            best_idx = max(range(len(rewards)), key=lambda i: rewards[i][0])
+            
+            # 从奖励最高的轨迹中提取信息并更新数据缓冲区
+            best_trajectory = trajectory_group[best_idx]
+            best_env = env_group[best_idx] if best_idx < len(env_group) else None
+            
+            if best_env and isinstance(best_env, BrowserEnv):
+                # 从最优轨迹中提取最后一步的信息
+                if best_trajectory.steps:
+                    # 为了更新数据缓冲区，我们需要访问环境的history
+                    # 这里我们直接使用环境的history，因为轨迹可能不包含完整的历史信息
+                    if len(best_env.history) >= 2:
+                        assistant_output = best_env.history[-1]  # Last message is assistant's response
+                        user_input = best_env.history[-2]        # Second to last is user's input (which includes the observation)
+                        
+                        # 假设我们能从action_uid中提取step_index，或者使用其他方式
+                        # 这里使用一个简化的步骤索引
+                        step_index = best_env.steps - 1
+                        annotation_id = best_env.task.annotation_id
+                        
+                        # Add this input-output pair to the data buffer for the next step
+                        data_buffer.add_step_result(annotation_id, step_index, user_input, assistant_output)
+        
+        # 返回所有轨迹的奖励，但只将最优轨迹的数据加入缓冲区
+        return [(0.0, {}) for _ in range(len(trajectory_group))]
 
 
 @dataclass(frozen=True)
@@ -652,10 +703,110 @@ class BrowserDataset(RLDataset):
         return (len(self.tasks) + self.batch_size - 1) // self.batch_size
 
 
+def load_mind2web_steps_from_annotation(annotation_id: str, action_uid: str) -> list[dict]:
+    """
+    Load the specific step from Mind2Web dataset based on annotation_id and action_uid.
+    This function would access the mind2web dataset to get the correct action for this step.
+    """
+    # Import the mind2web module to access its functions
+    import mind2web
+    
+    # Use the load_dataset function from mind2web module
+    from datasets import load_dataset
+    dataset = load_dataset("osunlp/Mind2Web", split="train")
+    
+    # Find the sample with the given annotation_id
+    for sample in dataset:
+        if sample['annotation_id'] == annotation_id:
+            # Find the specific action with the given action_uid
+            for action in sample['actions']:
+                if action['action_uid'] == action_uid:
+                    return action  # Return the specific action data
+    
+    # If not found, return None or raise an exception
+    return None
+
+
+class Mind2WebDataBuffer:
+    """
+    Data buffer to maintain step-by-step training data from Mind2Web dataset.
+    Each step's history includes the actual model input and output from previous steps.
+    """
+    def __init__(self):
+        self.buffer = {}  # Maps (annotation_id, step_index) to task with accumulated history
+
+    def add_step_result(self, annotation_id: str, step_index: int, model_input: Message, model_output: Message):
+        """
+        Add model input and output to the history for the next step.
+        """
+        key = (annotation_id, step_index + 1)  # Next step gets the history
+        if key not in self.buffer:
+            self.buffer[key] = []
+        
+        # Add the input and output to the history for the next step
+        self.buffer[key].extend([model_input, model_output])
+    
+    def get_history_for_step(self, annotation_id: str, step_index: int) -> list[Message]:
+        """
+        Get accumulated history for a specific step.
+        """
+        key = (annotation_id, step_index)
+        return self.buffer.get(key, [])
+
+
+# Global data buffer instance to maintain history across rollouts
+data_buffer = Mind2WebDataBuffer()
+
+
+def create_mind2web_tasks_with_dynamic_history() -> list[BrowserTask]:
+    """
+    Create BrowserTask objects with dynamic history from Mind2Web dataset.
+    Each step starts with history from previous steps in the same task.
+    """
+    import mind2web
+    from datasets import load_dataset
+    
+    # Load the Mind2Web dataset
+    dataset = load_dataset("osunlp/Mind2Web", split="train")
+    
+    tasks = []
+    
+    # Limit the number of samples for testing
+    sample_count = 0
+    max_samples = 3  # Limit for testing purposes
+    
+    for sample in dataset:
+        if sample_count >= max_samples:
+            break
+            
+        # Check if the required directory exists
+        if not os.path.exists(f"D:\\Globus\\{sample['annotation_id']}\\processed\\snapshots"):
+            continue
+        
+        # Create tasks for each action in the sample with accumulated history
+        for step_idx, action in enumerate(sample['actions']):
+            # Get history for this step from the data buffer
+            history = data_buffer.get_history_for_step(sample['annotation_id'], step_idx)
+            
+            task = BrowserTask(
+                annotation_id=sample['annotation_id'],
+                action_uid=action['action_uid'],
+                goal=sample['confirmed_task'],
+                start_url=sample.get('start_url', ''),
+                history=history  # Use accumulated history
+            )
+            
+            tasks.append(task)
+        
+        sample_count += 1
+        
+    return tasks
+
+
 @chz.chz
 class BrowserDatasetBuilder(RLDatasetBuilder):
     """
-    Builder for Browser RL Tasks.
+    Builder for Browser RL Tasks with step-by-step training support.
     """
     batch_size: int
     model_name_for_tokenizer: str
@@ -666,19 +817,24 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
     text_only: bool = False
     headless: bool = True
 
+    def _generate_tasks_with_history(self) -> list[BrowserTask]:
+        """Generates tasks with history from Mind2Web dataset."""
+        return create_mind2web_tasks_with_dynamic_history()
+
     def _generate_dummy_tasks(self) -> list[BrowserTask]:
         """Generates placeholder tasks as requested."""
         return [
-            BrowserTask("1", "Find the price of iPhone 15 on Amazon", "https://www.amazon.com"),
-            BrowserTask("2", "Search for 'Tinker RL' on Google", "https://www.google.com"),
-            BrowserTask("3", "Find the latest news on CNN", "https://www.cnn.com"),
+            BrowserTask("1", "action_1", "Find the price of iPhone 15 on Amazon", "https://www.amazon.com", []),
+            BrowserTask("2", "action_2", "Search for 'Tinker RL' on Google", "https://www.google.com", []),
+            BrowserTask("3", "action_3", "Find the latest news on CNN", "https://www.cnn.com", []),
         ] * 10  # Repeat to simulate a larger dataset
 
     async def __call__(self) -> tuple[RLDataset, RLDataset]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
         renderer = get_renderer(self.renderer_name, tokenizer=tokenizer)
 
-        tasks = self._generate_dummy_tasks()
+        # Use the Mind2Web dataset to generate tasks
+        tasks = self._generate_tasks_with_history()
 
         # Split 80/20
         split_idx = int(len(tasks) * 0.8)
@@ -704,3 +860,25 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
         )
 
         return train_ds, test_ds
+
+
+# Function to update the data buffer after a rollout step is completed
+def update_data_buffer_after_rollout(annotation_id: str, step_index: int, env: BrowserEnv):
+    """
+    Updates the data buffer with the actual model input and output after a rollout step.
+    This function should be called after each rollout step to maintain the history.
+    
+    Args:
+        annotation_id: The annotation ID of the current task
+        step_index: The index of the current step
+        env: The environment that just completed the step
+    """
+    # Get the last input (user message) and output (assistant message) from the environment history
+    if len(env.history) >= 2:
+        # The last two messages should be the most recent input and output
+        # In the history, the last message is the assistant's output, and the one before is the user's input
+        assistant_output = env.history[-1]  # Last message is assistant's response
+        user_input = env.history[-2]        # Second to last is user's input (which includes the observation)
+        
+        # Add this input-output pair to the data buffer for the next step
+        data_buffer.add_step_result(annotation_id, step_index, user_input, assistant_output)
