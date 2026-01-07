@@ -13,7 +13,7 @@ from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.image_processing_utils import get_image_processor
 
 # 导入 Environment
-from env import BrowserEnv, BrowserTask
+from env import BrowserEnv, BrowserTask, BrowserPool
 
 # API Key
 os.environ['TINKER_API_KEY'] = 'tml-Wrcd7jkyejehmtjAfQ8uUgyfyWtOwWQX8GCIqI6esrtLfD0FxsT6AiISJ5OPGovmjAAAA'
@@ -51,7 +51,8 @@ async def run_single_episode(args):
         goal=args.goal,
         start_url=args.url
     )
-    env = BrowserEnv(task, renderer, text_only=args.text_only, headless=False)
+    pool = BrowserPool(headless=False)
+    env = BrowserEnv(task, renderer, text_only=args.text_only, pool=pool)
 
     print(f"\n🚀 Starting Task: {task.goal}")
     print(f"🌐 URL: {task.start_url}")
@@ -144,8 +145,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct",
                         help="Tinker 平台上的 Base Model ID")
     parser.add_argument("--renderer_name", type=str, default=None)
-    parser.add_argument("--goal", type=str, default="Browse for wall art with a price range of $25 to $50.", help="任务目标")
-    parser.add_argument("--url", type=str, default="file:///D:/Globus/4b2030ff-b83c-445f-bf87-9c8fbc68498b/processed/snapshots/a4c16da0-0706-4d0a-a259-eb7657bbbbc9_before.mhtml", help="起始URL")
+    parser.add_argument("--goal", type=str, default="Translate hello world to Chinese", help="任务目标")
+    parser.add_argument("--url", type=str, default="https://www.iciba.com/", help="起始URL")
     parser.add_argument("--text_only", action="store_true")
 
     args = parser.parse_args()

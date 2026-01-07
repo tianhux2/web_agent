@@ -14,7 +14,6 @@ from typing import Any, List, Sequence, TypedDict, cast
 import chz
 import numpy as np
 from PIL import Image
-import asyncio
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
@@ -31,9 +30,10 @@ from tinker_cookbook.rl.types import (
     RLDataset,
     RLDatasetBuilder,
     StepResult,
+    Trajectory,
+    Metrics,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
-from tinker_cookbook.image_processing_utils import get_image_processor
 from tinker_cookbook.utils import logtree
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.model_info import get_recommended_renderer_name
@@ -87,7 +87,7 @@ Observation: {A labeled screenshot Given by User}"""
 SYSTEM_PROMPT_TEXT_ONLY = """Imagine you are a robot browsing the web, just like humans. Now you need to complete a task. In each iteration, you will receive an Accessibility Tree with numerical label representing information about the page, then follow the guidelines and choose one of the following actions:
 1. Click a Web Element.
 2. Delete existing content in a textbox and then type content. 
-3. Scroll up or down. Multiple scrolls are allowed to browse the webpage. Pay attention!! The default scroll is the whole window. If the scroll widget is located in a certain area of the webpage, then you have to specify a Web Element in that area. I would hover the mouse there and then scroll.
+3. Scroll up or down. Multiple scrolls are allowed to browse the webpage. Pay attention!! The default scroll is not the whole window. If the scroll widget is located in a certain area of the webpage, then you have to specify a Web Element in that area. I would hover the mouse there and then scroll.
 4. Wait. Typically used to wait for unfinished webpage processes, with a duration of 5 seconds.
 5. Go back, returning to the previous webpage.
 6. Google, directly jump to the Google search page. When you can't find information in some websites, try starting over with Google.
@@ -124,15 +124,13 @@ Observation: {Accessibility Tree of a web page}"""
 
 
 # ==============================================================================
-# SECTION 2: Web Controller (Selenium Wrapper)
+# SECTION 2: Selenium & WebArena Utils (Encapsulated)
 # ==============================================================================
 
 class WebController:
-    """Encapsulates all Selenium and WebArena logic.
-    Modified to be thread-safe when called via asyncio.to_thread.
-    """
+    """Encapsulates all Selenium and WebArena logic."""
 
-    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1280, 800), text_only: bool = False):
+    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1920, 1080), text_only: bool = False):
         self.headless = headless
         self.window_size = window_size
         self.text_only = text_only
@@ -147,32 +145,21 @@ class WebController:
             options.add_argument(
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
 
+        # Enable downloads
         options.add_experimental_option("prefs", {
             "plugins.always_open_pdf_externally": True
         })
 
+        options.add_argument("--force-device-scale-factor=1.5")
+
         self.driver = webdriver.Chrome(options=options)
         self.driver.set_window_size(*self.window_size)
-
-    def reset(self):
-        """Resets the browser state for reuse in the pool."""
-        try:
-            self.driver.quit()
-            self._init_driver()
-            # # Stop any pending loading
-            # self.driver.execute_script("window.stop();")
-            # # Go to blank page
-            # self.driver.get("about:blank")
-            # # Clear all state
-            # self.driver.delete_all_cookies()
-            # self.driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear();")
-        except Exception as e:
-            logger.error(f"Failed to reset browser: {e}")
 
     def navigate(self, url: str):
         try:
             self.driver.get(url)
             self._wait_for_stable_url()
+            # Inject focus script
             try:
                 self.driver.execute_script("window.focus();")
             except:
@@ -299,6 +286,7 @@ class WebController:
         time.sleep(0.5)
         rects, web_eles, web_eles_text = None, None, None
 
+        # Mark elements
         try:
             rects, web_eles, web_eles_text = self.get_web_element_rect(fix_color=True)
         except Exception as e:
@@ -306,9 +294,23 @@ class WebController:
             web_eles_text = "Error capturing element text."
             web_eles = []
 
+        # Capture Screenshot
         screenshot_b64 = self.driver.get_screenshot_as_base64()
-        resized_screenshot_b64 = self._resize_image_to_height(screenshot_b64, target_height=640)
+        
+        # Resize screenshot to 720p while maintaining aspect ratio
+        screenshot_b64 = self._resize_image_to_720p(screenshot_b64)
+        base64_string = screenshot_b64
+        if base64_string.startswith("data:image"):
+            base64_string = base64_string.split(",", 1)[1]
 
+        # 解码 Base64 字符串为二进制数据
+        image_data = base64.b64decode(base64_string)
+
+        # 保存到文件（例如保存为 PNG 格式）
+        with open(f"output_image{time.time()}.png", "wb") as f:
+            f.write(image_data)
+
+        # Clean up red boxes
         if rects:
             for rect_ele in rects:
                 try:
@@ -319,28 +321,29 @@ class WebController:
         return {
             "web_eles": web_eles,
             "web_text": web_eles_text,
-            "screenshot": resized_screenshot_b64
+            "screenshot": screenshot_b64
         }
-    
-    def _resize_image_to_height(self, image_b64: str, target_height: int = 720) -> str:
-        """Resize image to specified height while maintaining aspect ratio."""
+        
+    def _resize_image_to_720p(self, image_b64: str) -> str:
+        """Resize image to 720p while maintaining aspect ratio."""
         # Decode base64 image
         image_bytes = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(image_bytes))
         
-        # Calculate target width to maintain aspect ratio
+        # Target height is 720, calculate width to maintain aspect ratio
+        target_height = 720
         aspect_ratio = image.width / image.height
         target_width = int(target_height * aspect_ratio)
         
-        # Resize image using LANCZOS for high quality
+        # Resize image
         resized_image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
         
         # Convert back to base64
         buffer = io.BytesIO()
         resized_image.save(buffer, format='PNG')
-        resized_image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        resized_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
         
-        return resized_image_b64
+        return resized_b64
 
     def execute_raw_action(self, action_type: str, args: dict, context: dict):
         web_eles = context.get('web_eles')
@@ -362,6 +365,7 @@ class WebController:
                 if 0 <= idx < len(web_eles):
                     ele = web_eles[idx]
                     ele.clear()
+                    # Type safely
                     actions = ActionChains(self.driver)
                     actions.click(ele).send_keys(content).pause(0.5).send_keys(Keys.ENTER).perform()
                     self._wait_for_stable_url(5.0)
@@ -377,6 +381,7 @@ class WebController:
                     script = f"window.scrollBy(0, {scroll_amount});" if direction == 'down' else f"window.scrollBy(0, {-scroll_amount});"
                     self.driver.execute_script(script)
                 else:
+                    # Scroll specific element
                     idx = int(target)
                     if 0 <= idx < len(web_eles):
                         ele = web_eles[idx]
@@ -410,73 +415,16 @@ class WebController:
 
 
 # ==============================================================================
-# SECTION 2: Browser Pool
-# ==============================================================================
-
-class BrowserPool:
-    """Manages a pool of WebController instances."""
-
-    def __init__(self, size: int = 3, headless: bool = True):
-        self.size = size
-        self.headless = headless
-        self.queue = asyncio.Queue(maxsize=size)
-        self.browsers: list[WebController] = []
-        self._initialized = False
-        self._init_lock = asyncio.Lock()
-
-    async def initialize(self):
-        """Initializes the browser pool in background threads."""
-        async with self._init_lock:
-            if self._initialized: return
-
-            logger.info(f"Initializing browser pool with {self.size} instances...")
-            loop = asyncio.get_running_loop()
-            futures = []
-
-            for _ in range(self.size):
-                futures.append(loop.run_in_executor(None, self._create_browser))
-
-            await asyncio.gather(*futures)
-            self._initialized = True
-            logger.info("Browser pool ready.")
-
-    def _create_browser(self):
-        """Creates a browser instance (Sync, runs in thread)."""
-        browser = WebController(headless=self.headless)
-        self.queue.put_nowait(browser)
-        self.browsers.append(browser)
-
-    async def acquire(self) -> WebController:
-        """Asynchronously waits for an available browser."""
-        print("Acquiring browser...")
-        if not self._initialized:
-            await self.initialize()
-        # This await will yield if queue is empty, not blocking the loop
-        return await self.queue.get()
-
-    async def release(self, browser: WebController):
-        """Resets and returns the browser to the pool."""
-        if browser:
-            # Clean up in a thread to avoid blocking
-            await asyncio.to_thread(browser.reset)
-            await self.queue.put(browser)
-
-    async def shutdown(self):
-        """Closes all browsers."""
-        while not self.queue.empty():
-            browser = await self.queue.get()
-            await asyncio.to_thread(browser.close)
-
-
-# ==============================================================================
-# SECTION 3: Tinker Environment (Updated)
+# SECTION 3: Tinker Environment
 # ==============================================================================
 
 @dataclass
 class BrowserTask:
-    id: str
+    annotation_id: str
+    action_uid: str
     goal: str
     start_url: str
+    history: list[Message]
 
 
 class BrowserEnv(Env):
@@ -484,54 +432,47 @@ class BrowserEnv(Env):
         self,
         task: BrowserTask,
         renderer: Renderer,
-        pool: BrowserPool,  # Pass Pool instead of creating browser
-        text_only: bool = False
+        text_only: bool = False,
+        headless: bool = True
     ):
         self.task = task
         self.renderer = renderer
-        self.pool = pool
         self.text_only = text_only
+        self.browser = WebController(headless=headless, text_only=text_only)
 
-        self.browser: WebController = None  # Initialized in setup
         self.steps = 0
-        self.history: list[Message] = []
+        self.history: list[Message] = list(task.history) if task.history else []  # Initialize with task's history
         self.last_context = {}
         self.done = False
 
-    async def setup(self):
-        """Manually called to acquire resources."""
-        # Asynchronously wait for a browser from the pool
-        self.browser = await self.pool.acquire()
-
-        # Initial Navigation (in thread)
-        await asyncio.to_thread(self.browser.navigate, self.task.start_url)
+        # Initial Navigation - Load the mhtml file based on annotation_id and action_uid
+        mhtml_path = f"file://D:\\Globus\\{task.annotation_id}\\processed\\snapshots\\{task.action_uid}_before.mhtml"
+        self.browser.navigate(mhtml_path)
 
     @property
     def stop_condition(self) -> StopCondition:
         return self.renderer.get_stop_sequences()
 
-    async def _get_obs_async(self):
-        """Wrapper to get observation in thread."""
-        return await asyncio.to_thread(self.browser.get_capture)
+    def _format_msg(self, pdf_obs=None, warn_obs=None) -> Message:
+        """Uses the prompt-provided format_msg logic."""
 
-    async def _format_msg(self, pdf_obs=None, warn_obs=None) -> Message:
-        """Uses the prompt-provided format_msg logic (ASYNC version)."""
-
-        # Get current state from browser (ASYNC)
-        capture = await self._get_obs_async()
-        self.last_context = capture
+        # Get current state from browser
+        capture = self.browser.get_capture()
+        self.last_context = capture  # Cache for action execution
 
         web_img_b64 = capture['screenshot']
         web_text = capture['web_text']
 
         init_msg = f"Task Goal: {self.task.goal}\n"
 
-        if self.steps == 1:
+        # Note: We only add the initial message if there's no existing history
+        if len(self.history) <= 2:  # Only system message and initial user message
             init_msg += f"I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
 
             if self.text_only:
                 return {'role': 'user', 'content': init_msg}
 
+            # --- 修改点：使用 'image' 键，而不是 'image_url' ---
             return {
                 'role': 'user',
                 'content': [
@@ -549,6 +490,7 @@ class BrowserEnv(Env):
             if self.text_only:
                 return {'role': 'user', 'content': text_prompt}
 
+            # --- 修改点：使用 'image' 键，而不是 'image_url' ---
             return {
                 'role': 'user',
                 'content': [
@@ -560,51 +502,61 @@ class BrowserEnv(Env):
     async def initial_observation(self) -> tuple[ModelInput, StopCondition]:
         self.steps = 1
 
-        # Ensure setup is called if not already
-        if not self.browser:
-            await self.setup()
-
         # Select System Prompt
         sys_content = SYSTEM_PROMPT_TEXT_ONLY if self.text_only else SYSTEM_PROMPT_VISION
         sys_msg: Message = {"role": "system", "content": sys_content}
 
-        user_msg = await self._format_msg()  # Now awaited
-        self.history = [sys_msg, user_msg]
+        user_msg = self._format_msg()
+        # Only append to history if it's not already initialized
+        if not self.history:
+            self.history = [sys_msg, user_msg]
+        else:
+            # If history already exists (has previous steps), just add the new user message
+            self.history.append(user_msg)
 
         return self.renderer.build_generation_prompt(self.history), self.stop_condition
 
-    def _parse_and_execute_sync(self, action_text: str) -> tuple[str, bool]:
-        """Strict logic for parsing and executing (Blocking, runs in thread)."""
+    def _parse_and_execute(self, action_text: str) -> tuple[str, bool]:
+        """Parses the strict action format and executes via browser."""
         action_text = action_text.strip()
 
+        # Regex Matching based on System Prompt
+        # 1. ANSWER; [content]
         if action_text.startswith("ANSWER"):
             return f"Answered: {action_text}", True
 
+        # 2. Click [Numerical_Label]
         click_match = re.match(r"Click \[?(\d+)\]?", action_text, re.IGNORECASE)
         if click_match:
             return self.browser.execute_raw_action('click', {'id': click_match.group(1)}, self.last_context), False
 
+        # 3. Type [Numerical_Label]; [Content]
         type_match = re.match(r"Type \[?(\d+)\]?[; ]+\[?(.[^\]]*)\]?", action_text, re.IGNORECASE)
         if type_match:
             return self.browser.execute_raw_action('type', {'id': type_match.group(1), 'content': type_match.group(2)},
                                                    self.last_context), False
 
+        # 4. Scroll [Numerical_Label or WINDOW]; [up or down]
         scroll_match = re.match(r"Scroll \[?(\d+|WINDOW)\]?[; ]+\[?(up|down)\]?", action_text, re.IGNORECASE)
         if scroll_match:
             return self.browser.execute_raw_action('scroll', {'target': scroll_match.group(1),
                                                               'direction': scroll_match.group(2)},
                                                    self.last_context), False
 
+        # 5. Wait
         if "Wait" in action_text:
             return self.browser.execute_raw_action('wait', {}, self.last_context), False
 
+        # 6. GoBack
         if "GoBack" in action_text:
             return self.browser.execute_raw_action('goback', {}, self.last_context), False
 
+        # 7. Google
         if "Google" in action_text:
             return self.browser.execute_raw_action('google', {}, self.last_context), False
 
-        return "Invalid Action Format.", False
+        # --- MODIFICATION: Return specific Format Error string ---
+        return "Invalid Action Format. Please strictly follow the format: 'Click [id]', 'Type [id]; [content]', etc. Check your syntax and try again.", False
 
     async def step(self, action: Action) -> StepResult:
         self.steps += 1
@@ -613,40 +565,39 @@ class BrowserEnv(Env):
         (action_message, _) = self.renderer.parse_response(action)
         model_content = ensure_text(action_message["content"])
 
+        # Log model thought/action
         logtree.log_text(f"Step {self.steps} Model Output: {model_content}")
-        print(f"Step {self.steps} Model Output: {model_content}")
 
+        # Extract "Action: ..." part if model outputs Thought + Action
         action_line = model_content
         if "Action:" in model_content:
             parts = model_content.split("Action:")
             if len(parts) > 1:
-                action_line = parts[1].strip().split('\n')[0]
+                action_line = parts[1].strip().split('\n')[0]  # Take the first line after Action:
 
         self.history.append({"role": "assistant", "content": model_content})
 
-        # 2. Execute (ASYNC WRAPPER)
-        # We run the synchronous parse_and_execute logic in a thread
-        feedback, done = await asyncio.to_thread(self._parse_and_execute_sync, action_line)
-
+        # 2. Execute
+        feedback, done = self._parse_and_execute(action_line)
         logtree.log_text(f"Execution Result: {feedback}")
-        print(f"Execution Result: {feedback}; Done: {done}")
 
-        # 3. Reward Calculation
+        # 3. Reward Calculation (Modified for Penalty)
         reward = 0.0
         if done and "Answered" in feedback:
             reward = 1.0
         elif "Invalid Action Format" in feedback:
+            # --- MODIFICATION: Apply Penalty ---
             reward = -1.0
 
         # 4. Get Next Observation
         next_obs_msg = None
         if not done:
-            next_obs_msg = await self._format_msg(warn_obs=feedback)  # Now awaited
+            # We treat feedback as 'warn_obs'. If it was a format error, 'feedback' contains the warning.
+            next_obs_msg = self._format_msg(warn_obs=feedback)
             self.history.append(next_obs_msg)
             next_input = self.renderer.build_generation_prompt(self.history)
         else:
             next_input = ModelInput.empty()
-            await self.pool.release(self.browser)
 
         return StepResult(
             next_observation=next_input,
@@ -656,15 +607,9 @@ class BrowserEnv(Env):
             metrics={"success": float(reward > 0), "format_error": float(reward < 0)}
         )
 
-    async def close(self):
-        """Release the browser back to the pool."""
-        if self.browser:
-            await self.pool.release(self.browser)
-            self.browser = None
-
 
 # ==============================================================================
-# SECTION 4: Dataset & Builders
+# SECTION 4: Dataset & Builders with Step-by-Step Training Support
 # ==============================================================================
 
 @dataclass(frozen=True)
@@ -672,14 +617,58 @@ class BrowserEnvGroupBuilder(EnvGroupBuilder):
     tasks: list[BrowserTask]
     renderer: Renderer
     text_only: bool
-    pool: BrowserPool
+    headless: bool
 
     async def make_envs(self) -> Sequence[Env]:
-        print("tasks:", [(task.goal, task.start_url) for task in self.tasks])
         return [
-            BrowserEnv(task, self.renderer, self.pool, self.text_only)
+            BrowserEnv(task, self.renderer, self.text_only, self.headless)
             for task in self.tasks
         ]
+    
+    async def compute_group_rewards(
+        self, 
+        trajectory_group: list[Trajectory], 
+        env_group: Sequence[Env]
+    ) -> list[tuple[float, Metrics]]:
+        """
+        计算组中每条轨迹的奖励，然后只将奖励最高的最优轨迹的输入输出加入到数据缓冲区中，
+        确保历史累积数据的质量和有效性。
+        """
+        # 计算每条轨迹的奖励
+        rewards = []
+        for trajectory in trajectory_group:
+            # 从轨迹中获取奖励信息
+            total_reward = sum([step.reward for step in trajectory.steps])
+            metrics = trajectory.steps[-1].metrics if trajectory.steps else {}
+            rewards.append((total_reward, metrics))
+        
+        # 找到奖励最高的轨迹索引
+        if rewards:
+            best_idx = max(range(len(rewards)), key=lambda i: rewards[i][0])
+            
+            # 从奖励最高的轨迹中提取信息并更新数据缓冲区
+            best_trajectory = trajectory_group[best_idx]
+            best_env = env_group[best_idx] if best_idx < len(env_group) else None
+            
+            if best_env and isinstance(best_env, BrowserEnv):
+                # 从最优轨迹中提取最后一步的信息
+                if best_trajectory.steps:
+                    # 为了更新数据缓冲区，我们需要访问环境的history
+                    # 这里我们直接使用环境的history，因为轨迹可能不包含完整的历史信息
+                    if len(best_env.history) >= 2:
+                        assistant_output = best_env.history[-1]  # Last message is assistant's response
+                        user_input = best_env.history[-2]        # Second to last is user's input (which includes the observation)
+                        
+                        # 假设我们能从action_uid中提取step_index，或者使用其他方式
+                        # 这里使用一个简化的步骤索引
+                        step_index = best_env.steps - 1
+                        annotation_id = best_env.task.annotation_id
+                        
+                        # Add this input-output pair to the data buffer for the next step
+                        data_buffer.add_step_result(annotation_id, step_index, user_input, assistant_output)
+        
+        # 返回所有轨迹的奖励，但只将最优轨迹的数据加入缓冲区
+        return [(0.0, {}) for _ in range(len(trajectory_group))]
 
 
 @dataclass(frozen=True)
@@ -688,8 +677,8 @@ class BrowserDataset(RLDataset):
     renderer: Renderer
     batch_size: int
     group_size: int
-    pool: BrowserPool
     text_only: bool = False
+    headless: bool = True
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         start = index * self.batch_size
@@ -698,47 +687,157 @@ class BrowserDataset(RLDataset):
 
         builders = []
         for task in batch:
+            # 所有任务都包含在训练中，因为history的验证逻辑已经移除
+            # 只有在compute_group_rewards中完成history后才会更新数据缓冲区
             builders.append(
                 BrowserEnvGroupBuilder(
                     tasks=[task] * self.group_size,
                     renderer=self.renderer,
                     text_only=self.text_only,
-                    pool=self.pool,
+                    headless=self.headless,
+                    num_envs=self.group_size,
+                    dataset_name="web_browser"
                 )
             )
+
         return builders
 
     def __len__(self) -> int:
         return (len(self.tasks) + self.batch_size - 1) // self.batch_size
 
 
+def load_mind2web_steps_from_annotation(annotation_id: str, action_uid: str) -> list[dict]:
+    """
+    Load the specific step from Mind2Web dataset based on annotation_id and action_uid.
+    This function would access the mind2web dataset to get the correct action for this step.
+    """
+    # Import the mind2web module to access its functions
+    import mind2web
+    
+    # Use the load_dataset function from mind2web module
+    from datasets import load_dataset
+    dataset = load_dataset("osunlp/Mind2Web", split="train")
+    
+    # Find the sample with the given annotation_id
+    for sample in dataset:
+        if sample['annotation_id'] == annotation_id:
+            # Find the specific action with the given action_uid
+            for action in sample['actions']:
+                if action['action_uid'] == action_uid:
+                    return action  # Return the specific action data
+    
+    # If not found, return None or raise an exception
+    return None
+
+
+class Mind2WebDataBuffer:
+    """
+    Data buffer to maintain step-by-step training data from Mind2Web dataset.
+    Each step's history includes the actual model input and output from previous steps.
+    """
+    def __init__(self):
+        self.buffer = {}  # Maps (annotation_id, step_index) to task with accumulated history
+
+    def add_step_result(self, annotation_id: str, step_index: int, model_input: Message, model_output: Message):
+        """
+        Add model input and output to the history for the next step.
+        """
+        key = (annotation_id, step_index + 1)  # Next step gets the history
+        if key not in self.buffer:
+            self.buffer[key] = []
+        
+        # Add the input and output to the history for the next step
+        self.buffer[key].extend([model_input, model_output])
+    
+    def get_history_for_step(self, annotation_id: str, step_index: int) -> list[Message]:
+        """
+        Get accumulated history for a specific step.
+        """
+        key = (annotation_id, step_index)
+        return self.buffer.get(key, [])
+
+
+# Global data buffer instance to maintain history across rollouts
+data_buffer = Mind2WebDataBuffer()
+
+
+def create_mind2web_tasks_with_dynamic_context() -> list[BrowserTask]:
+    """
+    Create BrowserTask objects without binding to specific tasks initially.
+    Context is fetched dynamically when needed during execution.
+    """
+    import mind2web
+    from datasets import load_dataset
+    
+    # Load the Mind2Web dataset
+    dataset = load_dataset("osunlp/Mind2Web", split="train")
+    
+    tasks = []
+    
+    # Limit the number of samples for testing
+    sample_count = 0
+    max_samples = 3  # Limit for testing purposes
+    
+    for sample in dataset:
+        if sample_count >= max_samples:
+            break
+            
+        # Check if the required directory exists
+        if not os.path.exists(f"D:\\Globus\\{sample['annotation_id']}\\processed\\snapshots"):
+            continue
+        
+        # Create tasks for each action in the sample with empty history initially
+        # Context will be fetched dynamically during execution
+        for step_idx, action in enumerate(sample['actions']):
+            # For the first step, initialize with empty history
+            # For subsequent steps, the history will be populated dynamically when available
+            task = BrowserTask(
+                annotation_id=sample['annotation_id'],
+                action_uid=action['action_uid'],
+                goal=sample['confirmed_task'],
+                start_url=sample.get('start_url', ''),
+                history=[]  # Start with empty history for all steps initially
+            )
+            
+            tasks.append(task)
+        
+        sample_count += 1
+        
+    return tasks
+
+
 @chz.chz
 class BrowserDatasetBuilder(RLDatasetBuilder):
     """
-    Builder for Browser RL Tasks.
+    Builder for Browser RL Tasks with step-by-step training support.
     """
     batch_size: int
     model_name_for_tokenizer: str
     renderer_name: str
     group_size: int
-    pool: BrowserPool
 
     # Custom Configs
     text_only: bool = False
+    headless: bool = True
+
+    def _generate_tasks_with_context(self) -> list[BrowserTask]:
+        """Generates tasks with context fetched dynamically during execution."""
+        return create_mind2web_tasks_with_dynamic_context()
 
     def _generate_dummy_tasks(self) -> list[BrowserTask]:
         """Generates placeholder tasks as requested."""
         return [
-            BrowserTask("1", "Translate hello world to Chinese", "https://www.iciba.com/"),
-            BrowserTask("2", "Translate hello world to Chinese", "https://translate.google.com/"),
-        ] * 2  # Repeat to simulate a larger dataset
+            BrowserTask("1", "action_1", "Find the price of iPhone 15 on Amazon", "https://www.amazon.com", []),
+            BrowserTask("2", "action_2", "Search for 'Tinker RL' on Google", "https://www.google.com", []),
+            BrowserTask("3", "action_3", "Find the latest news on CNN", "https://www.cnn.com", []),
+        ] * 10  # Repeat to simulate a larger dataset
 
     async def __call__(self) -> tuple[RLDataset, RLDataset]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
-        image_processor = get_image_processor(self.model_name_for_tokenizer)
-        renderer = get_renderer(self.renderer_name, tokenizer=tokenizer, image_processor=image_processor)
+        renderer = get_renderer(self.renderer_name, tokenizer=tokenizer)
 
-        tasks = self._generate_dummy_tasks()
+        # Use the Mind2Web dataset to generate tasks
+        tasks = self._generate_tasks_with_context()
 
         # Split 80/20
         split_idx = int(len(tasks) * 0.8)
@@ -751,7 +850,7 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
             batch_size=self.batch_size,
             group_size=self.group_size,
             text_only=self.text_only,
-            pool=self.pool
+            headless=self.headless
         )
 
         test_ds = BrowserDataset(
@@ -760,7 +859,29 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
             batch_size=self.batch_size,
             group_size=1,  # Test usually uses group_size=1
             text_only=self.text_only,
-            pool=self.pool
+            headless=self.headless
         )
 
         return train_ds, test_ds
+
+
+# Function to update the data buffer after a rollout step is completed
+def update_data_buffer_after_rollout(annotation_id: str, step_index: int, env: BrowserEnv):
+    """
+    Updates the data buffer with the actual model input and output after a rollout step.
+    This function should be called after each rollout step to maintain the history.
+    
+    Args:
+        annotation_id: The annotation ID of the current task
+        step_index: The index of the current step
+        env: The environment that just completed the step
+    """
+    # Get the last input (user message) and output (assistant message) from the environment history
+    if len(env.history) >= 2:
+        # The last two messages should be the most recent input and output
+        # In the history, the last message is the assistant's output, and the one before is the user's input
+        assistant_output = env.history[-1]  # Last message is assistant's response
+        user_input = env.history[-2]        # Second to last is user's input (which includes the observation)
+        
+        # Add this input-output pair to the data buffer for the next step
+        data_buffer.add_step_result(annotation_id, step_index, user_input, assistant_output)
