@@ -16,9 +16,12 @@ import numpy as np
 from PIL import Image
 import asyncio
 from selenium import webdriver
+from selenium.common import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
+
+from reward import calculate_reward
 
 import tinker
 from tinker import ModelInput
@@ -72,7 +75,7 @@ Key Guidelines You MUST follow:
 5) When a complex Task involves multiple questions or steps, select "ANSWER" only at the very end, after addressing all of these questions (steps). Flexibly combine your own abilities with the information in the web page. Double check the formatting requirements in the task when ANSWER. 
 * Web Browsing Guidelines *
 1) Don't interact with useless web elements like Login, Sign-in, donation that appear in Webpages. Pay attention to Key Web Elements like search textbox and menu.
-2) Vsit video websites like YouTube is allowed BUT you can't play videos. Clicking to download PDF is allowed and will be analyzed by the Assistant API.
+2) Visit video websites like YouTube is allowed BUT you can't play videos.
 3) Focus on the numerical labels in the TOP LEFT corner of each rectangle (element). Ensure you don't mix them up with other numbers (e.g. Calendar) on the page.
 4) Focus on the date in task, you must look for results that match the date. It may be necessary to find the correct year, month and day at calendar.
 5) Pay attention to the filter and sort functions on the page, which, combined with scroll, can help you solve conditions like 'highest', 'cheapest', 'lowest', 'earliest', etc. Try your best to find the answer that best fits the task.
@@ -84,43 +87,7 @@ Action: {One Action format you choose}
 Then the User will provide:
 Observation: {A labeled screenshot Given by User}"""
 
-SYSTEM_PROMPT_TEXT_ONLY = """Imagine you are a robot browsing the web, just like humans. Now you need to complete a task. In each iteration, you will receive an Accessibility Tree with numerical label representing information about the page, then follow the guidelines and choose one of the following actions:
-1. Click a Web Element.
-2. Delete existing content in a textbox and then type content. 
-3. Scroll up or down. Multiple scrolls are allowed to browse the webpage. Pay attention!! The default scroll is the whole window. If the scroll widget is located in a certain area of the webpage, then you have to specify a Web Element in that area. I would hover the mouse there and then scroll.
-4. Wait. Typically used to wait for unfinished webpage processes, with a duration of 5 seconds.
-5. Go back, returning to the previous webpage.
-6. Google, directly jump to the Google search page. When you can't find information in some websites, try starting over with Google.
-7. Answer. This action should only be chosen when all questions in the task have been solved.
 
-Correspondingly, Action should STRICTLY follow the format:
-- Click [Numerical_Label]
-- Type [Numerical_Label]; [Content]
-- Scroll [Numerical_Label or WINDOW]; [up or down]
-- Wait
-- GoBack
-- Google
-- ANSWER; [content]
-
-Key Guidelines You MUST follow:
-* Action guidelines *
-1) To input text, NO need to click textbox first, directly type content. After typing, the system automatically hits `ENTER` key. Sometimes you should click the search button to apply search filters. Try to use simple language when searching.  
-2) You must Distinguish between textbox and search button, don't type content into the button! If no textbox is found, you may need to click the search button first before the textbox is displayed. 
-3) Execute only one action per iteration. 
-4) STRICTLY Avoid repeating the same action if the webpage remains unchanged. You may have selected the wrong web element or numerical label. Continuous use of the Wait is also NOT allowed.
-5) When a complex Task involves multiple questions or steps, select "ANSWER" only at the very end, after addressing all of these questions (steps). Flexibly combine your own abilities with the information in the web page. Double check the formatting requirements in the task when ANSWER. 
-* Web Browsing Guidelines *
-1) Don't interact with useless web elements like Login, Sign-in, donation that appear in Webpages. Pay attention to Key Web Elements like search textbox and menu.
-2) Vsit video websites like YouTube is allowed BUT you can't play videos. Clicking to download PDF is allowed and will be analyzed by the Assistant API.
-3) Focus on the date in task, you must look for results that match the date. It may be necessary to find the correct year, month and day at calendar.
-4) Pay attention to the filter and sort functions on the page, which, combined with scroll, can help you solve conditions like 'highest', 'cheapest', 'lowest', 'earliest', etc. Try your best to find the answer that best fits the task.
-
-Your reply should strictly follow the format:
-Thought: {Your brief thoughts (briefly summarize the info that will help ANSWER)}
-Action: {One Action format you choose}
-
-Then the User will provide:
-Observation: {Accessibility Tree of a web page}"""
 
 
 # ==============================================================================
@@ -132,10 +99,9 @@ class WebController:
     Modified to be thread-safe when called via asyncio.to_thread.
     """
 
-    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1280, 800), text_only: bool = False):
+    def __init__(self, headless: bool = True, window_size: tuple[int, int] = (1920, 1080)):
         self.headless = headless
         self.window_size = window_size
-        self.text_only = text_only
         self.driver = None
         self._init_driver()
 
@@ -146,11 +112,7 @@ class WebController:
             options.add_argument("--headless")
             options.add_argument(
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-
-        options.add_experimental_option("prefs", {
-            "plugins.always_open_pdf_externally": True
-        })
-
+        options.add_argument("--force-device-scale-factor=1")
         self.driver = webdriver.Chrome(options=options)
         self.driver.set_window_size(*self.window_size)
 
@@ -172,7 +134,7 @@ class WebController:
     def navigate(self, url: str):
         try:
             self.driver.get(url)
-            self._wait_for_stable_url()
+            self._wait_for_stable()
             try:
                 self.driver.execute_script("window.focus();")
             except:
@@ -180,24 +142,58 @@ class WebController:
             # Inject scroll preventer
             self.driver.execute_script(
                 """window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea') {e.preventDefault();}};""")
-            time.sleep(2)
         except Exception as e:
             logger.error(f"Navigation failed: {e}")
 
-    def _wait_for_stable_url(self, timeout=5.0):
+    def _wait_for_stable(self, timeout=5, idle_threshold=0.5):
+        idle_threshold_ms = idle_threshold * 1000
         end_time = time.time() + timeout
-        last_url = self.driver.current_url
-        stable_counter = 0
+
+        script = """
+            var ignoreAttributes = arguments[0];
+
+            if (!document.body) {
+                return null; 
+            }
+
+            if (!window.domObserver) {
+                window.lastDomMutationTime = Date.now();
+
+                var config = { 
+                    childList: true, 
+                    subtree: true, 
+                    characterData: true,
+                    attributes: !ignoreAttributes
+                };
+
+                window.domObserver = new MutationObserver((mutations) => {
+                    window.lastDomMutationTime = Date.now();
+                });
+
+                window.domObserver.observe(document.body, config);
+            }
+
+            return Date.now() - (window.lastDomMutationTime || Date.now());
+            """
+
         while time.time() < end_time:
-            time.sleep(0.5)
-            current_url = self.driver.current_url
-            if current_url == last_url:
-                stable_counter += 1
-                if stable_counter >= 2: break
-            else:
-                last_url = current_url
-                stable_counter = 0
-                end_time = time.time() + timeout
+            try:
+                idle_time_ms = self.driver.execute_script(script, True)
+
+                if idle_time_ms is None:
+                    time.sleep(0.1)
+                    continue
+
+                is_js_complete = self.driver.execute_script("return document.readyState") == "complete"
+                if is_js_complete and idle_time_ms >= idle_threshold_ms:
+                    return True
+
+            except WebDriverException:
+                pass
+
+            time.sleep(0.1)
+
+        return False
 
     def get_web_element_rect(self, fix_color=True):
         selected_function = "getFixedColor" if fix_color else "getRandomColor"
@@ -296,8 +292,9 @@ class WebController:
 
     def get_capture(self):
         """Captures observation: screenshot (base64) and SOM/Text."""
-        time.sleep(0.5)
         rects, web_eles, web_eles_text = None, None, None
+
+        time.sleep(0.5)
 
         try:
             rects, web_eles, web_eles_text = self.get_web_element_rect(fix_color=True)
@@ -351,7 +348,7 @@ class WebController:
                     ele = web_eles[idx]
                     self.driver.execute_script("arguments[0].setAttribute('target', '_self')", ele)
                     ele.click()
-                    self._wait_for_stable_url(3.0)
+                    self._wait_for_stable()
                     return "Clicked."
                 else:
                     return "Error: Element ID out of range."
@@ -364,7 +361,7 @@ class WebController:
                     ele.clear()
                     actions = ActionChains(self.driver)
                     actions.click(ele).send_keys(content).pause(0.5).send_keys(Keys.ENTER).perform()
-                    self._wait_for_stable_url(5.0)
+                    self._wait_for_stable()
                     return f"Typed '{content}'."
                 else:
                     return "Error: Element ID out of range."
@@ -384,7 +381,6 @@ class WebController:
                         actions.move_to_element(ele)
                         key = Keys.ARROW_DOWN if direction == 'down' else Keys.ARROW_UP
                         actions.key_down(Keys.ALT).send_keys(key).key_up(Keys.ALT).perform()
-                time.sleep(1)
                 return f"Scrolled {direction}."
 
             elif action_type == 'wait':
@@ -393,7 +389,7 @@ class WebController:
 
             elif action_type == 'goback':
                 self.driver.back()
-                self._wait_for_stable_url()
+                self._wait_for_stable()
                 return "Went back."
 
             elif action_type == 'google':
@@ -436,15 +432,19 @@ class BrowserPool:
             for _ in range(self.size):
                 futures.append(loop.run_in_executor(None, self._create_browser))
 
-            await asyncio.gather(*futures)
+            browsers = await asyncio.gather(*futures)
+
+            for browser in browsers:
+                self.browsers.append(browser)
+                self.queue.put_nowait(browser)
+
             self._initialized = True
             logger.info("Browser pool ready.")
 
     def _create_browser(self):
         """Creates a browser instance (Sync, runs in thread)."""
         browser = WebController(headless=self.headless)
-        self.queue.put_nowait(browser)
-        self.browsers.append(browser)
+        return browser
 
     async def acquire(self) -> WebController:
         """Asynchronously waits for an available browser."""
@@ -485,12 +485,10 @@ class BrowserEnv(Env):
         task: BrowserTask,
         renderer: Renderer,
         pool: BrowserPool,  # Pass Pool instead of creating browser
-        text_only: bool = False
     ):
         self.task = task
         self.renderer = renderer
         self.pool = pool
-        self.text_only = text_only
 
         self.browser: WebController = None  # Initialized in setup
         self.steps = 0
@@ -514,7 +512,7 @@ class BrowserEnv(Env):
         """Wrapper to get observation in thread."""
         return await asyncio.to_thread(self.browser.get_capture)
 
-    async def _format_msg(self, pdf_obs=None, warn_obs=None) -> Message:
+    async def _format_msg(self, warn_obs=None) -> Message:
         """Uses the prompt-provided format_msg logic (ASYNC version)."""
 
         # Get current state from browser (ASYNC)
@@ -529,9 +527,6 @@ class BrowserEnv(Env):
         if self.steps == 1:
             init_msg += f"I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
 
-            if self.text_only:
-                return {'role': 'user', 'content': init_msg}
-
             return {
                 'role': 'user',
                 'content': [
@@ -541,13 +536,9 @@ class BrowserEnv(Env):
             }
         else:
             prefix = ""
-            if pdf_obs: prefix += f"Observation: {pdf_obs} "
             if warn_obs: prefix += f"Observation: {warn_obs} "
 
             text_prompt = f"{prefix}Please analyze the attached screenshot and give the Thought and Action. I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
-
-            if self.text_only:
-                return {'role': 'user', 'content': text_prompt}
 
             return {
                 'role': 'user',
@@ -565,7 +556,7 @@ class BrowserEnv(Env):
             await self.setup()
 
         # Select System Prompt
-        sys_content = SYSTEM_PROMPT_TEXT_ONLY if self.text_only else SYSTEM_PROMPT_VISION
+        sys_content = SYSTEM_PROMPT_VISION
         sys_msg: Message = {"role": "system", "content": sys_content}
 
         user_msg = await self._format_msg()  # Now awaited
@@ -634,9 +625,11 @@ class BrowserEnv(Env):
         # 3. Reward Calculation
         reward = 0.0
         if done and "Answered" in feedback:
-            reward = 1.0
+            reward = calculate_reward(self.history)
         elif "Invalid Action Format" in feedback:
             reward = -1.0
+
+        print(f"Reward: {reward}")
 
         # 4. Get Next Observation
         next_obs_msg = None
@@ -646,7 +639,7 @@ class BrowserEnv(Env):
             next_input = self.renderer.build_generation_prompt(self.history)
         else:
             next_input = ModelInput.empty()
-            await self.pool.release(self.browser)
+            await self.close()
 
         return StepResult(
             next_observation=next_input,
@@ -671,13 +664,12 @@ class BrowserEnv(Env):
 class BrowserEnvGroupBuilder(EnvGroupBuilder):
     tasks: list[BrowserTask]
     renderer: Renderer
-    text_only: bool
     pool: BrowserPool
 
     async def make_envs(self) -> Sequence[Env]:
         print("tasks:", [(task.goal, task.start_url) for task in self.tasks])
         return [
-            BrowserEnv(task, self.renderer, self.pool, self.text_only)
+            BrowserEnv(task, self.renderer, self.pool)
             for task in self.tasks
         ]
 
@@ -689,7 +681,6 @@ class BrowserDataset(RLDataset):
     batch_size: int
     group_size: int
     pool: BrowserPool
-    text_only: bool = False
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         start = index * self.batch_size
@@ -702,7 +693,6 @@ class BrowserDataset(RLDataset):
                 BrowserEnvGroupBuilder(
                     tasks=[task] * self.group_size,
                     renderer=self.renderer,
-                    text_only=self.text_only,
                     pool=self.pool,
                 )
             )
@@ -723,8 +713,7 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
     group_size: int
     pool: BrowserPool
 
-    # Custom Configs
-    text_only: bool = False
+
 
     def _generate_dummy_tasks(self) -> list[BrowserTask]:
         """Generates placeholder tasks as requested."""
@@ -750,7 +739,6 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
             renderer=renderer,
             batch_size=self.batch_size,
             group_size=self.group_size,
-            text_only=self.text_only,
             pool=self.pool
         )
 
@@ -759,7 +747,6 @@ class BrowserDatasetBuilder(RLDatasetBuilder):
             renderer=renderer,
             batch_size=self.batch_size,
             group_size=1,  # Test usually uses group_size=1
-            text_only=self.text_only,
             pool=self.pool
         )
 
